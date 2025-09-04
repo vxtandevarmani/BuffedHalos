@@ -4,4 +4,4 @@
 
 Basically uses ROPs to queue indirect syscalls and hash signatures to detect stub tampering which is more robust than tartarus & halos gate and all values are stored from output params so this PoC actually isnt doing something impractical (until CET kicks in...)
 
-PS. Also you can change the JOP gadget to anything else thats non-volatile register I used rcx because its the only thing available
+PS. Also you can change the JOP gadget to anything else thats non-volatile register I used rcx because its the only thing available and you can use NtContinue if you want for any reason
