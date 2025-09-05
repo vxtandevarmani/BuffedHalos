@@ -82,7 +82,7 @@ typedef enum{
 	RET_SIZE = 1,
 } GADGETS_LENGTHS;
 
-// r10 -> rdx -> r8 -> r9  21341
+// 	r10 -> rdx -> r8 -> r9  21341
 //	everytime you add an argument to a struct subtract 8 from padding to maintain struct size
 
 typedef struct ROP_FRAME{
@@ -123,7 +123,9 @@ PBYTE grab_dll_ptr(uint64_t Hash){
 	PPEB PebStruct					= (PPEB)__readgsqword(0x60);
 	char DllName[MAX_PATH];
 	memset(DllName, 0, MAX_PATH);
-	if(!PebStruct || !PebStruct->LoaderData){
+	if(	!PebStruct || 
+		!PebStruct->LoaderData
+	){
 		return NULL;
 	}
 	LIST_ENTRY* HeadDllList = PebStruct->LoaderData->InLoadOrderModuleList.Flink;
@@ -272,7 +274,6 @@ bool AnotherGate(	DWORD SyscallServiceNumber,
 		printf("[-] An error in calling the proxied syscall has occured 0x%llX\n", ReturnValue);
 		return false;
 	}
-	printf("[*] Syscall stub for 0x%p\n", (void*)(ULONG_PTR)SyscallAddressJmp);
 	
 	RtlCaptureContext(&RopCTX);
 	RopCTX.Rip = (DWORD64)gadgets->ret;
@@ -285,8 +286,8 @@ bool AnotherGate(	DWORD SyscallServiceNumber,
 	RopChain[0].Function	= (DWORD64)gadgets->jmp_rcx;
 	RopChain[0].RCXArg1		= (DWORD64)SyscallAddressJmp;
 	
-	RopChain[FRAMES-1].RCXArg1	= (DWORD64)&SaveCTX;
-	RopChain[FRAMES-1].Function	= (DWORD64)RtlRestoreContext;
+	RopChain[FRAMES - 1].RCXArg1	= (DWORD64)&SaveCTX;
+	RopChain[FRAMES - 1].Function	= (DWORD64)RtlRestoreContext;
 	Triggered = !Triggered;
 	puts("[*] Calling RtlRestoreContext");
 	RtlRestoreContext(&RopCTX, NULL);
@@ -301,7 +302,7 @@ int main(void){
 	const char jmp_rcx_g[JOP_SIZE]					= { '\xff', '\xe1' };			 // jmp rcx
 	const char jmp_rax_g[JOP_SIZE]					= { '\xff', '\xe0' };			// jmp rax
 	const char pop_rdx_rcx_r8_r9_r10_r11_g[POP_SIZE]= { '\x5a', '\x59','\x41', '\x58', '\x41', '\x59', '\x41', '\x5a', '\x41', '\x5b', '\xc3' }; // pop r8; pop r9; pop r10; pop r11; ret
-	const char add_rsp_216_g[ADD_RSP_SIZE]			= { '\x48', '\x81', '\xc4', '\xd8', '\x00', '\x00', '\x00', '\xc3' };	// add rsp, 0xD ; ret
+	const char add_rsp_216_g[ADD_RSP_SIZE]			= { '\x48', '\x81', '\xc4', '\xd8', '\x00', '\x00', '\x00', '\xc3' };						// add rsp, 0xD ; ret
 	
 	const char SyscallStub[STUB_SIZE]	= {	'\x4c', '\x8b', '\xd1', 
 											'\xb8', '\x00', '\x00', '\x00', '\x00', 
@@ -391,17 +392,19 @@ int main(void){
 		puts("[-] Failed to retrieve SSN");
 		return -1;
 	}
-	DWORD64	arg4		= 0x1000;
-	PVOID	arg2		= NULL;
-	RopChain[0].R10Arg1 = (DWORD64)GetCurrentProcess();
-	RopChain[0].arg2	= (DWORD64)&arg2;
-	RopChain[0].arg3	= (DWORD64)0;
-	RopChain[0].arg4	= (DWORD64)&arg4;
-	RopChain[0].arg5	= (DWORD64)MEM_COMMIT | MEM_RESERVE;
-	RopChain[0].arg6	= (DWORD64)PAGE_EXECUTE_READWRITE;
+	PVOID	arg2	= NULL;
+	ULONG	arg4	= 0x1000;
+	RopChain[0]		= (ROP_FRAME){
+						.R10Arg1	= (DWORD64)GetCurrentProcess(),
+						.arg2		= (DWORD64)&arg2,
+						.arg3		= (DWORD64)0,
+						.arg4		= (DWORD64)&arg4,
+						.arg5		= (DWORD64)MEM_COMMIT | MEM_RESERVE,
+						.arg6		= (DWORD64)PAGE_EXECUTE_READWRITE,
+	};
 	
 	if(AnotherGate(SyscallServiceNumber, SyscallAddressJmp, &GadgetArray, RopChain)){
-		puts("[+] Good job this implementation actually works!!!");
+		printf("[+] Good job this implementation actually works!!!\n[.] NtVirtualAllocate succeeded w. memory located @ 0x%p with size of %ld bytes\n", arg2, arg4);
 	}
 	else{
 		puts("[-] This is going to be a bad time for you....");
