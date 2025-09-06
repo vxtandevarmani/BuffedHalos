@@ -350,11 +350,11 @@ int main(void){
 	GadgetArray.add_rsp 					= (DWORD64)pattern_scan(add_rsp_216_g, ADD_RSP_SIZE, (HMODULE)NtdllBaseAddress);
 	GadgetArray.pop_rdx_rcx_r8_r9_r10_r11	= (DWORD64)pattern_scan(pop_rdx_rcx_r8_r9_r10_r11_g, POP_SIZE, (HMODULE)NtdllBaseAddress);
 
-	CHECK_GADGET("0", 						GadgetArray.ret);
-	CHECK_GADGET("0", 					GadgetArray.jmp_rcx);
-	CHECK_GADGET("0", 					GadgetArray.jmp_rax);
-	CHECK_GADGET("0", 					GadgetArray.add_rsp);
-	CHECK_GADGET("0",	GadgetArray.pop_rdx_rcx_r8_r9_r10_r11);
+	CHECK_GADGET("ret", 						GadgetArray.ret);
+	CHECK_GADGET("jmp_rcx", 					GadgetArray.jmp_rcx);
+	CHECK_GADGET("jmp_rax", 					GadgetArray.jmp_rax);
+	CHECK_GADGET("add_rsp", 					GadgetArray.add_rsp);
+	CHECK_GADGET("pop_rdx_rcx_r8_r9_r10_r11",	GadgetArray.pop_rdx_rcx_r8_r9_r10_r11);
 
 	
 	dynamic_ssn_retrieval(	fn1va(NtVirtualAllocate), 
